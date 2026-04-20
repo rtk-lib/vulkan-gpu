@@ -738,6 +738,14 @@ bool VulkanApp::process_input(float dt) {
     cam_pos.y -= speed;
     moved = true;
   }
+  if (glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS) {
+    if (cam_fov > 10)
+      cam_fov--;
+  }
+  if (glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS) {
+    if (cam_fov < 120)
+      cam_fov++;
+  }
 
   // Mouse look
   double mx, my;
@@ -769,7 +777,7 @@ void VulkanApp::update_camera_ubo() {
   glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
   glm::vec3 up = glm::cross(right, forward);
 
-  constexpr float VFOV = 40.0f * 3.14159265f / 180.0f;
+  float VFOV = cam_fov * 3.14159265f / 180.0f;
   constexpr float ASPECT = float(W) / float(H);
   float h = std::tan(VFOV * 0.5f);
 

@@ -45,8 +45,13 @@ struct RTKScene {
 
 class VulkanApp {
 public:
+#ifdef __APPLE__
+  static constexpr uint32_t W = 1280 * 3;
+  static constexpr uint32_t H = 720 * 3;
+#else
   static constexpr uint32_t W = 1280;
   static constexpr uint32_t H = 720;
+#endif
   static constexpr int MAX_FRAMES = 2;
 
   void run();
@@ -126,6 +131,7 @@ private:
   float cam_yaw = 0.0f;
   float cam_pitch = -0.10f;
   float cam_speed = 8.0f;
+  float cam_fov = 40.0f;
   double last_time = 0.0;
   double last_mx = 0.0;
   double last_my = 0.0;
