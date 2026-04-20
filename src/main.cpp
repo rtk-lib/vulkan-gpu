@@ -1,14 +1,12 @@
+#include "Logger/Logger.hpp"
 #include "vulkan_app.h"
-#include <iostream>
-#include <stdexcept>
 
 int main() {
   try {
     VulkanApp app;
     app.run();
   } catch (const std::exception &e) {
-    std::cerr << "Fatal: " << e.what() << "\n";
-    return 1;
+    return LOG_FATAL(e.what()), EXIT_FAILURE;
   }
-  return 0;
+  return EXIT_SUCCESS;
 }

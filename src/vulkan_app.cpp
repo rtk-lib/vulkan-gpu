@@ -6,6 +6,7 @@
 #include <iostream>
 #include <stdexcept>
 
+#include "Logger/Logger.hpp"
 #include "vulkan_app.h"
 
 // Validation layers
@@ -116,7 +117,7 @@ void VulkanApp::create_instance() {
 
   validation_enabled = ENABLE_VALIDATION && check_validation_layer_support();
   if (ENABLE_VALIDATION && !validation_enabled)
-    std::cerr << "[Vulkan] Validation layers not available, disabling.\n";
+    LOG_WARN("[Vulkan] Validation layers not available, disabling.");
 
   uint32_t glfw_count = 0;
   const char **glfw_ext = glfwGetRequiredInstanceExtensions(&glfw_count);
@@ -187,14 +188,14 @@ void VulkanApp::pick_physical_device() {
     vkGetPhysicalDeviceProperties(d, &p);
     if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
       phys_dev = d;
-      std::cout << "GPU: " << p.deviceName << "\n";
+      LOG_INFO(std::format("Used GPU [{}]", p.deviceName));
       return;
     }
   }
   phys_dev = devs[0];
   VkPhysicalDeviceProperties p;
   vkGetPhysicalDeviceProperties(phys_dev, &p);
-  std::cout << "GPU: " << p.deviceName << "\n";
+  LOG_INFO(std::format("Used GPU [{}]", p.deviceName));
 }
 
 // Logical device
@@ -345,12 +346,9 @@ void VulkanApp::build_scene() {
 
   spheres.push_back(sphere({0, 12, 0}, 3.0f, {1.0f, 0.92f, 0.8f}, 15.0f));
 
-  spheres.push_back(
-      sphere({12, 5, 0}, 7.5f, {0.8f, 0.15f, 0.15f}));
-  spheres.push_back(
-      sphere({-12, 5, 0}, 7.5f, {0.15f, 0.8f, 0.15f}));
-  spheres.push_back(
-      sphere({0, 5, -12}, 7.5f, {0.8f, 0.8f, 0.8f}));
+  spheres.push_back(sphere({12, 5, 0}, 7.5f, {0.8f, 0.15f, 0.15f}));
+  spheres.push_back(sphere({-12, 5, 0}, 7.5f, {0.15f, 0.8f, 0.15f}));
+  spheres.push_back(sphere({0, 5, -12}, 7.5f, {0.8f, 0.8f, 0.8f}));
 
   spheres.push_back(sphere({0, 1.5f, 0}, 1.5f, {1, 1, 1}, 0, 2, 0.0f, 1.5f));
 
@@ -371,8 +369,8 @@ void VulkanApp::build_scene() {
       sphere({-1.0f, 0.3f, 3.5f}, 0.3f, {1.0f, 0.5f, 0.1f}, 8.0f));
 
   bvh.build(spheres);
-  std::cout << "Scene: " << spheres.size() << " spheres, " << bvh.nodes.size()
-            << " BVH nodes\n";
+  LOG_INFO(std::format("Scene: [{}] spheres, [{}] BVH nodes", spheres.size(),
+                       bvh.nodes.size()));
 }
 
 static void map_copy(VkDevice dev, VkDeviceMemory mem, const void *src,
