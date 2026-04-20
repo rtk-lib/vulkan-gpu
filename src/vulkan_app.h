@@ -23,6 +23,26 @@ struct alignas(16) Camera {
   float _p4;
 }; // 80 bytes
 
+// structs from rtk files
+struct RTKCamera {
+  int fov;
+  glm::vec3 position;
+  glm::vec3 direction;
+  bool active;
+};
+
+struct RTKObj {
+  std::string objPath;
+  std::string rtlPath;
+  glm::vec3 position;
+  glm::vec3 rotation;
+  glm::vec3 scale;
+};
+
+struct RTKScene {
+  std::vector<RTKObj> objects;
+};
+
 class VulkanApp {
 public:
   static constexpr uint32_t W = 1280;
