@@ -17,6 +17,7 @@ clean:
 format:
 	@ find ./ -name "*.cpp" -type f -exec clang-format -i {} ";"
 	@ find ./ -name "*.hpp" -type f -exec clang-format -i {} ";"
+	@ clang-format -i shaders/*
 	@ $(LOG_TIME) "$(C_BLUE) CF $(C_GREEN) Code formated  $(C_RESET)"
 
 check_format:
