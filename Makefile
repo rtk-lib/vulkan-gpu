@@ -3,13 +3,16 @@ BUILD := build
 .PHONY: all clean
 
 all: $(BUILD)/Makefile
-	$(MAKE) -C $(BUILD) -j$(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu)
+	@ $(MAKE) -C $(BUILD) -j$(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu)
 
 $(BUILD)/Makefile:
-	cmake -B $(BUILD)
+	@ cmake -B $(BUILD)
+
+include utils.mk
 
 clean:
-	rm -rf $(BUILD)
+	@ rm -rf build
+	@ $(LOG_TIME) "$(C_YELLOW) RM $(C_YELLOW) build/  $(C_RESET)"
 
 format:
 	@ find ./ -name "*.cpp" -type f -exec clang-format -i {} ";"
