@@ -39,6 +39,12 @@ struct RTKObj {
   glm::vec3 scale;
 };
 
+struct RTKLight {
+  glm::vec3 position;
+  glm::vec3 color;
+  float size;
+};
+
 struct RTKScene {
   std::vector<RTKObj> objects;
 };
