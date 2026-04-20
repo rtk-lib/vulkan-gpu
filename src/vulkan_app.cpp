@@ -739,12 +739,16 @@ bool VulkanApp::process_input(float dt) {
     moved = true;
   }
   if (glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS) {
-    if (cam_fov > 10)
+    if (cam_fov > 10) {
       cam_fov--;
+      moved = true;
+    }
   }
   if (glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS) {
-    if (cam_fov < 120)
+    if (cam_fov < 120) {
       cam_fov++;
+      moved = true;
+    }
   }
 
   // Mouse look
