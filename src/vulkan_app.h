@@ -22,6 +22,14 @@ struct Vertex {
     glm::vec2 uv;
 };
 
+// Software BVH node (flat array, must match GLSL layout exactly)
+struct BVHNode {
+    glm::vec3 bbox_min;
+    int       left_or_first; // left child index (internal) or first prim index (leaf)
+    glm::vec3 bbox_max;
+    int       tri_count;     // 0 = internal node, >0 = leaf
+};
+
 // Pour chaque matériau glTF — couleurs PBR + textures optionnelles
 struct GPUMaterial {
     // vec4 aligné : base color RGBA (used when base_tex == 0xFFFFFFFF)
@@ -100,16 +108,23 @@ private:
     VkBuffer       index_buffer  = VK_NULL_HANDLE;
     VkDeviceMemory index_mem     = VK_NULL_HANDLE;
 
-    // Acceleration structures
+    // Hardware acceleration structures (RT GPUs only)
     VkBuffer                    blas_buffer     = VK_NULL_HANDLE;
     VkDeviceMemory              blas_mem        = VK_NULL_HANDLE;
     VkAccelerationStructureKHR  blas            = VK_NULL_HANDLE;
-
     VkBuffer                    tlas_buffer     = VK_NULL_HANDLE;
     VkDeviceMemory              tlas_mem        = VK_NULL_HANDLE;
     VkAccelerationStructureKHR  tlas            = VK_NULL_HANDLE;
     VkBuffer                    instance_buffer = VK_NULL_HANDLE;
     VkDeviceMemory              instance_mem    = VK_NULL_HANDLE;
+
+    // Software BVH fallback (non-RT GPUs)
+    std::vector<BVHNode>        sw_bvh_nodes;
+    std::vector<uint32_t>       sw_bvh_prim_ids;
+    VkBuffer                    bvh_node_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory              bvh_node_mem    = VK_NULL_HANDLE;
+    VkBuffer                    bvh_prim_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory              bvh_prim_mem    = VK_NULL_HANDLE;
 
     // Textures du modèle (toutes les images glTF)
     std::vector<Texture>     model_textures;
@@ -148,6 +163,7 @@ private:
     std::vector<VkSemaphore>   render_done;
     std::vector<VkFence>       fences;
 
+    bool     hw_rt              = false;
     bool     validation_enabled = false;
     uint32_t frame_index        = 0;
 
@@ -183,6 +199,7 @@ private:
     void load_gltf(const std::string &filepath);
     void create_blas();
     void create_tlas();
+    void build_sw_bvh();
     void create_texture_from_image(const tinygltf::Image &img);
 
     void draw_frame(uint32_t flight);

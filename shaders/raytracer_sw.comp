@@ -1,0 +1,261 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_descriptor_indexing  : enable
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 1, rgba8) uniform image2D disp_img;
+
+struct Camera { vec4 origin; vec4 horizontal; vec4 vertical; vec4 lower_left; uvec4 dimensions; };
+layout(binding = 2) uniform CameraUBO { Camera cam; };
+
+struct BVHNode {
+    vec3 bbox_min; int  left_or_first; // left child (internal) or first prim (leaf)
+    vec3 bbox_max; int  tri_count;     // 0 = internal, >0 = leaf
+};
+layout(binding = 3, std430) readonly buffer BVHNodes   { BVHNode n[]; } bvh_nodes;
+layout(binding = 4, std430) readonly buffer BVHPrimIds { uint    p[]; } bvh_prims;
+layout(binding = 5, std430) readonly buffer Vertices   { float   v[]; } vertices;
+layout(binding = 6, std430) readonly buffer Indices    { uint    i[]; } indices;
+
+struct MaterialInfo {
+    float base_r, base_g, base_b, base_a;
+    float metallic, roughness, emissive, _pad;
+    uint  base_tex, mr_tex, _pad0, _pad1;
+};
+layout(binding = 7, std430) readonly buffer Materials    { MaterialInfo m[]; } materials;
+layout(binding = 8, std430) readonly buffer TriMaterials { uint mat_id[];    } tri_materials;
+layout(binding = 9)         uniform sampler2D textures[];
+
+// ─── Random ──────────────────────────────────────────────────────────────────
+float hash(inout uint seed) {
+    seed = (seed ^ 61u) ^ (seed >> 16u);
+    seed *= 9u;
+    seed  = seed ^ (seed >> 4u);
+    seed *= 0x27d4eb2du;
+    seed  = seed ^ (seed >> 15u);
+    return float(seed) / 4294967296.0;
+}
+vec3 rand_sphere(inout uint seed) {
+    float u = hash(seed), v = hash(seed);
+    float theta = 6.2831853 * u, phi = acos(2.0*v - 1.0);
+    return vec3(sin(phi)*cos(theta), sin(phi)*sin(theta), cos(phi));
+}
+
+// ─── Model transform: same as TLAS instance (180° around X → negate y,z) ────
+vec3 model_pos(uint idx) {
+    vec3 p = vec3(vertices.v[idx*8u], vertices.v[idx*8u+1u], vertices.v[idx*8u+2u]);
+    return vec3(p.x, -p.y, -p.z);
+}
+vec3 model_normal(uint idx) {
+    vec3 n = vec3(vertices.v[idx*8u+3u], vertices.v[idx*8u+4u], vertices.v[idx*8u+5u]);
+    return vec3(n.x, -n.y, -n.z);
+}
+vec2 model_uv(uint idx) {
+    return vec2(vertices.v[idx*8u+6u], vertices.v[idx*8u+7u]);
+}
+
+// ─── Ray-AABB slab test ───────────────────────────────────────────────────────
+bool hit_aabb(vec3 ro, vec3 inv_rd, vec3 bmin, vec3 bmax, float t_max) {
+    vec3 t0    = (bmin - ro) * inv_rd;
+    vec3 t1    = (bmax - ro) * inv_rd;
+    vec3 tmin  = min(t0, t1), tmax = max(t0, t1);
+    float tenter = max(max(tmin.x, tmin.y), tmin.z);
+    float texit  = min(min(tmax.x, tmax.y), tmax.z);
+    return texit >= max(tenter, 0.0) && tenter < t_max;
+}
+
+// ─── Möller-Trumbore triangle intersection ────────────────────────────────────
+bool intersect_tri(vec3 ro, vec3 rd,
+                   vec3 p0, vec3 p1, vec3 p2,
+                   out float t, out vec2 bary) {
+    vec3  e1 = p1 - p0, e2 = p2 - p0;
+    vec3  h  = cross(rd, e2);
+    float a  = dot(e1, h);
+    if (abs(a) < 1e-7) return false;
+    float f  = 1.0 / a;
+    vec3  s  = ro - p0;
+    float u  = f * dot(s, h);
+    if (u < 0.0 || u > 1.0) return false;
+    vec3  q  = cross(s, e1);
+    float v  = f * dot(rd, q);
+    if (v < 0.0 || u + v > 1.0) return false;
+    t = f * dot(e2, q);
+    bary = vec2(u, v);
+    return t > 1e-4;
+}
+
+// ─── BVH traversal (closest hit) ─────────────────────────────────────────────
+bool traverse(vec3 ro, vec3 rd, float t_max,
+              out float hit_t, out int hit_prim, out vec2 hit_bary) {
+    vec3 inv_rd = 1.0 / rd;
+    hit_t = t_max; hit_prim = -1;
+
+    int stack[64]; int sp = 0;
+    stack[sp++] = 0;
+
+    while (sp > 0) {
+        BVHNode node = bvh_nodes.n[stack[--sp]];
+        if (!hit_aabb(ro, inv_rd, node.bbox_min, node.bbox_max, hit_t)) continue;
+
+        if (node.tri_count > 0) {
+            for (int k = 0; k < node.tri_count; k++) {
+                uint pi = bvh_prims.p[node.left_or_first + k];
+                uint i0 = indices.i[pi*3u], i1 = indices.i[pi*3u+1u], i2 = indices.i[pi*3u+2u];
+                float t; vec2 bary;
+                if (intersect_tri(ro, rd, model_pos(i0), model_pos(i1), model_pos(i2), t, bary)
+                    && t < hit_t) {
+                    hit_t = t; hit_prim = int(pi); hit_bary = bary;
+                }
+            }
+        } else if (sp < 62) {
+            stack[sp++] = node.left_or_first;
+            stack[sp++] = node.left_or_first + 1;
+        }
+    }
+    return hit_prim >= 0;
+}
+
+// ─── BVH traversal (any hit — for shadow rays) ───────────────────────────────
+bool occluded(vec3 ro, vec3 rd, float max_t) {
+    vec3 inv_rd = 1.0 / rd;
+    int stack[64]; int sp = 0;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        BVHNode node = bvh_nodes.n[stack[--sp]];
+        if (!hit_aabb(ro, inv_rd, node.bbox_min, node.bbox_max, max_t)) continue;
+        if (node.tri_count > 0) {
+            for (int k = 0; k < node.tri_count; k++) {
+                uint pi = bvh_prims.p[node.left_or_first + k];
+                uint i0 = indices.i[pi*3u], i1 = indices.i[pi*3u+1u], i2 = indices.i[pi*3u+2u];
+                float t; vec2 bary;
+                if (intersect_tri(ro, rd, model_pos(i0), model_pos(i1), model_pos(i2), t, bary)
+                    && t < max_t)
+                    return true;
+            }
+        } else if (sp < 62) {
+            stack[sp++] = node.left_or_first;
+            stack[sp++] = node.left_or_first + 1;
+        }
+    }
+    return false;
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+void main() {
+    ivec2 pixel    = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 screen   = imageSize(disp_img);
+    if (pixel.x >= screen.x || pixel.y >= screen.y) return;
+
+    uint seed = uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + cam.dimensions.z * 26699u;
+
+    vec2 jitter = vec2(hash(seed) - 0.5, hash(seed) - 0.5);
+    vec2 uv     = (vec2(pixel) + 0.5 + jitter) / vec2(screen);
+
+    vec3 ray_origin = cam.origin.xyz;
+    vec3 ray_dir    = normalize(cam.lower_left.xyz
+                              + uv.x * cam.horizontal.xyz
+                              + uv.y * cam.vertical.xyz
+                              - cam.origin.xyz);
+
+    vec3 sample_color = vec3(0.0);
+    vec3 throughput   = vec3(1.0);
+
+    for (int bounce = 0; bounce < 3; bounce++) {
+
+        // ── Primary / bounce ray ─────────────────────────────────────────────
+        float hit_t; int hit_prim; vec2 hit_bary;
+        bool hit_geo = traverse(ray_origin, ray_dir, 10000.0, hit_t, hit_prim, hit_bary);
+
+        // ── Ground plane (y = 0) ─────────────────────────────────────────────
+        float t_plane   = -ray_origin.y / ray_dir.y;
+        bool  hit_plane = t_plane > 0.001 && t_plane < 1000.0
+                          && (!hit_geo || t_plane < hit_t);
+        if (hit_plane) { hit_geo = false; hit_t = t_plane; }
+
+        if (!hit_geo && !hit_plane) {
+            // ── Sky ──────────────────────────────────────────────────────────
+            vec3  ld  = normalize(vec3(cos(float(cam.dimensions.z)*0.01), 1.5,
+                                       sin(float(cam.dimensions.z)*0.01)));
+            float sun = pow(max(dot(ray_dir, ld), 0.0), 100.0) * 2.0;
+            vec3  sky = mix(vec3(0.2), vec3(0.05,0.1,0.2), 0.5*(ray_dir.y+1.0)) + sun;
+            sample_color += sky * throughput;
+            break;
+        }
+
+        vec3  hit_pos    = ray_origin + ray_dir * hit_t;
+        vec3  normal;
+        vec3  albedo;
+        float roughness  = 0.5, metalness = 0.0, reflectivity = 0.0;
+
+        if (hit_plane) {
+            // ── Ground ───────────────────────────────────────────────────────
+            normal       = vec3(0.0, 1.0, 0.0);
+            float check  = mod(floor(hit_pos.x) + floor(hit_pos.z), 2.0);
+            albedo       = mix(vec3(0.5,0.5,0.0), vec3(1.0,1.0,0.0), check);
+            roughness    = 0.05;
+            metalness    = 0.2;
+            reflectivity = 0.4;
+        } else {
+            // ── Mesh geometry ─────────────────────────────────────────────────
+            uint i0 = indices.i[uint(hit_prim)*3u];
+            uint i1 = indices.i[uint(hit_prim)*3u+1u];
+            uint i2 = indices.i[uint(hit_prim)*3u+2u];
+            float w = 1.0 - hit_bary.x - hit_bary.y;
+
+            vec3 n0 = model_normal(i0), n1 = model_normal(i1), n2 = model_normal(i2);
+            normal = normalize(n0*w + n1*hit_bary.x + n2*hit_bary.y);
+            if (dot(normal, ray_dir) > 0.0) normal = -normal;
+
+            vec2 tc0 = model_uv(i0), tc1 = model_uv(i1), tc2 = model_uv(i2);
+            vec2 texCoord = tc0*w + tc1*hit_bary.x + tc2*hit_bary.y;
+
+            uint matID = tri_materials.mat_id[hit_prim];
+            MaterialInfo mat = materials.m[matID];
+
+            if (mat.base_tex != 0xFFFFFFFFu)
+                albedo = texture(textures[nonuniformEXT(mat.base_tex)], texCoord).rgb;
+            else
+                albedo = vec3(mat.base_r, mat.base_g, mat.base_b);
+
+            if (mat.mr_tex != 0xFFFFFFFFu) {
+                vec4 mr = texture(textures[nonuniformEXT(mat.mr_tex)], texCoord);
+                roughness = mr.g; metalness = mr.b;
+            } else {
+                roughness = mat.roughness; metalness = mat.metallic;
+            }
+            reflectivity = mix(0.04, 0.9, metalness);
+        }
+
+        // ── Lighting ─────────────────────────────────────────────────────────
+        vec3  light_dir = normalize(vec3(cos(float(cam.dimensions.z)*0.01), 1.5,
+                                          sin(float(cam.dimensions.z)*0.01)));
+        float shadow = 0.0;
+        for (int s = 0; s < 4; s++) {
+            vec3 L = normalize(light_dir + rand_sphere(seed) * 0.05);
+            if (!occluded(hit_pos + normal*0.001, L, 100.0)) shadow += 0.25;
+        }
+
+        vec3  reflect_dir = reflect(ray_dir, normal);
+        float fresnel     = pow(1.0 - max(dot(normal, -ray_dir), 0.0), 5.0);
+        float spec_lobe   = pow(max(dot(reflect_dir, light_dir), 0.0),
+                                mix(4.0, 128.0, 1.0 - roughness));
+        float diff        = max(dot(normal, light_dir), 0.0) * shadow;
+
+        vec3 diffuse_col  = albedo * (1.0 - metalness);
+        vec3 specular_col = mix(vec3(0.02), albedo, metalness);
+        vec3 local_color  = diffuse_col*(diff+0.05) + specular_col*(fresnel+spec_lobe)*shadow;
+
+        sample_color += local_color * (1.0 - reflectivity) * throughput;
+
+        throughput *= reflectivity;
+        ray_dir    = normalize(reflect_dir + roughness * rand_sphere(seed));
+        ray_origin = hit_pos + normal * 0.001;
+
+        if (dot(throughput, vec3(1.0)) < 0.03) break;
+    }
+
+    sample_color  = clamp(sample_color * 0.6, 0.0, 1.0);
+    sample_color  = pow(sample_color, vec3(1.0 / 2.2));
+    imageStore(disp_img, pixel, vec4(sample_color, 1.0));
+}

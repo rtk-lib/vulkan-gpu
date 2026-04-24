@@ -27,7 +27,8 @@ set(SHADER_BIN_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_BIN_DIR})
 
 set(SHADER_SOURCES
-    ${SHADER_SRC_DIR}/raytracer.comp
+    ${SHADER_SRC_DIR}/raytracer_hw.comp
+    ${SHADER_SRC_DIR}/raytracer_sw.comp
     ${SHADER_SRC_DIR}/display.vert
     ${SHADER_SRC_DIR}/display.frag
 )

@@ -1,9 +1,13 @@
+#include <algorithm>
 #include <array>
 #include <cassert>
+#include <cfloat>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <glm/gtc/matrix_transform.hpp>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 
 #include "Logger/Logger.hpp"
@@ -65,10 +69,14 @@ void VulkanApp::init_vulkan() {
   }
   create_swapchain();
   create_render_images();
-  load_gltf("/media/data/vulkan-gpu/Object3d/dodge_challegner_srt_hellcat.glb");
+  load_gltf("./Object3d/dodge_challegner_srt_hellcat.glb");
   upload_scene();
-  create_blas();
-  create_tlas();
+  if (hw_rt) {
+    create_blas();
+    create_tlas();
+  } else {
+    build_sw_bvh();
+  }
   create_compute_pipeline();
   create_display_pipeline();
   create_commands_and_sync();
@@ -235,45 +243,63 @@ void VulkanApp::create_logical_device() {
   qci.queueCount = 1;
   qci.pQueuePriorities = &prio;
 
- // 1. Les extensions nécessaires au Hardware RT
-  std::vector<const char *> dev_exts = {
-      VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-      VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
-      VK_KHR_RAY_QUERY_EXTENSION_NAME,
-      VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME
+  // Enumerate available extensions to detect RT support
+  uint32_t ext_count = 0;
+  vkEnumerateDeviceExtensionProperties(phys_dev, nullptr, &ext_count, nullptr);
+  std::vector<VkExtensionProperties> avail_exts(ext_count);
+  vkEnumerateDeviceExtensionProperties(phys_dev, nullptr, &ext_count, avail_exts.data());
+  auto has_ext = [&](const char* name) {
+    for (const auto& e : avail_exts) if (strcmp(e.extensionName, name) == 0) return true;
+    return false;
   };
+
+  hw_rt = has_ext(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+          has_ext(VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+          has_ext(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+  LOG_INFO(hw_rt ? "RT hardware: ON (TLAS/BLAS)" : "RT hardware: OFF (software BVH fallback)");
+
+  std::vector<const char*> dev_exts = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
 #ifdef __APPLE__
   dev_exts.push_back("VK_KHR_portability_subset");
 #endif
+  if (hw_rt) {
+    dev_exts.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    dev_exts.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    dev_exts.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+  }
 
-  VkPhysicalDeviceBufferDeviceAddressFeatures bda_feats{};
-  bda_feats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+  // Query what's actually supported to avoid requesting unsupported features
+  VkPhysicalDeviceDescriptorIndexingFeatures di_avail{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+  VkPhysicalDeviceFeatures2 feats2_query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+  feats2_query.pNext = &di_avail;
+  vkGetPhysicalDeviceFeatures2(phys_dev, &feats2_query);
+
+  // All feature structs declared at same scope (must outlive vkCreateDevice)
+  VkPhysicalDeviceDescriptorIndexingFeatures di_feats{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+  di_feats.runtimeDescriptorArray                    = di_avail.runtimeDescriptorArray;
+  di_feats.shaderSampledImageArrayNonUniformIndexing = di_avail.shaderSampledImageArrayNonUniformIndexing;
+  di_feats.descriptorBindingVariableDescriptorCount  = di_avail.descriptorBindingVariableDescriptorCount;
+  di_feats.descriptorBindingPartiallyBound           = di_avail.descriptorBindingPartiallyBound;
+
+  VkPhysicalDeviceBufferDeviceAddressFeatures bda_feats{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
   bda_feats.bufferDeviceAddress = VK_TRUE;
 
-  VkPhysicalDeviceDescriptorIndexingFeatures di_feats{};
-  di_feats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
-  di_feats.runtimeDescriptorArray                    = VK_TRUE;
-  di_feats.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
-  di_feats.descriptorBindingVariableDescriptorCount  = VK_TRUE;
-  di_feats.descriptorBindingPartiallyBound           = VK_TRUE;
-  di_feats.pNext = &bda_feats;
-
-  VkPhysicalDeviceRayQueryFeaturesKHR rq_feats{};
-  rq_feats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+  VkPhysicalDeviceRayQueryFeaturesKHR rq_feats{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
   rq_feats.rayQuery = VK_TRUE;
-  rq_feats.pNext = &di_feats;
 
-  VkPhysicalDeviceAccelerationStructureFeaturesKHR as_feats{};
-  as_feats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+  VkPhysicalDeviceAccelerationStructureFeaturesKHR as_feats{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
   as_feats.accelerationStructure = VK_TRUE;
-  as_feats.pNext = &rq_feats;
+
+  if (hw_rt) {
+    di_feats.pNext  = &bda_feats;
+    bda_feats.pNext = &rq_feats;
+    rq_feats.pNext  = &as_feats;
+  }
 
   VkPhysicalDeviceFeatures feats{};
-  feats.shaderInt64 = VK_TRUE;
 
-  VkDeviceCreateInfo ci{};
-  ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-  ci.pNext = &as_feats;
+  VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+  ci.pNext = &di_feats;
   ci.queueCreateInfoCount = 1;
   ci.pQueueCreateInfos = &qci;
   ci.enabledExtensionCount = (uint32_t)dev_exts.size();
@@ -428,19 +454,18 @@ void VulkanApp::upload_scene() {
 
   constexpr auto FLAGS = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
+  VkBufferUsageFlags geo_extra = hw_rt
+    ? (VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+       VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR)
+    : 0;
+
   VkDeviceSize vertex_sz = vertices.size() * sizeof(Vertex);
-  create_buffer(vertex_sz,
-    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+  create_buffer(vertex_sz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | geo_extra,
     FLAGS, vertex_buffer, vertex_mem);
   { void* p; vkMapMemory(device,vertex_mem,0,vertex_sz,0,&p); memcpy(p,vertices.data(),vertex_sz); vkUnmapMemory(device,vertex_mem); }
 
   VkDeviceSize index_sz = indices.size() * sizeof(uint32_t);
-  create_buffer(index_sz,
-    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+  create_buffer(index_sz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | geo_extra,
     FLAGS, index_buffer, index_mem);
   { void* p; vkMapMemory(device,index_mem,0,index_sz,0,&p); memcpy(p,indices.data(),index_sz); vkUnmapMemory(device,index_mem); }
 
@@ -461,103 +486,141 @@ void VulkanApp::upload_scene() {
 void VulkanApp::create_compute_pipeline() {
   const uint32_t tex_count = (uint32_t)model_textures.size();
 
-  std::array<VkDescriptorSetLayoutBinding, 9> bindings{};
-  bindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-  bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-  bindings[2] = {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-  bindings[3] = {3, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-  bindings[4] = {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-  bindings[5] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-  bindings[6] = {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // materials
-  bindings[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // tri_mat_ids
-  bindings[8] = {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, tex_count,  VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // textures[]
-
-  std::array<VkDescriptorBindingFlags, 9> binding_flags{};
-  binding_flags[8] = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT
-                   | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-
-  VkDescriptorSetLayoutBindingFlagsCreateInfo flags_ci{};
-  flags_ci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
-  flags_ci.bindingCount  = (uint32_t)binding_flags.size();
-  flags_ci.pBindingFlags = binding_flags.data();
-
-  VkDescriptorSetLayoutCreateInfo dsli{};
-  dsli.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  dsli.pNext        = &flags_ci;
-  dsli.bindingCount = (uint32_t)bindings.size();
-  dsli.pBindings    = bindings.data();
-  VK_CHECK(vkCreateDescriptorSetLayout(device, &dsli, nullptr, &comp_dsl));
-
-  std::array<VkDescriptorPoolSize, 5> pool_sizes{};
-  pool_sizes[0] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              2};
-  pool_sizes[1] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,             1};
-  pool_sizes[2] = {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1};
-  pool_sizes[3] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,     tex_count};
-  pool_sizes[4] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             4};
-
-  VkDescriptorPoolCreateInfo pi{};
-  pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  pi.maxSets       = 1;
-  pi.poolSizeCount = (uint32_t)pool_sizes.size();
-  pi.pPoolSizes    = pool_sizes.data();
-  VK_CHECK(vkCreateDescriptorPool(device, &pi, nullptr, &comp_pool));
-
-  VkDescriptorSetVariableDescriptorCountAllocateInfo var_alloc{};
-  var_alloc.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO;
-  var_alloc.descriptorSetCount = 1;
-  var_alloc.pDescriptorCounts  = &tex_count;
-
-  VkDescriptorSetAllocateInfo ai{};
-  ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-  ai.pNext              = &var_alloc;
-  ai.descriptorPool     = comp_pool;
-  ai.descriptorSetCount = 1;
-  ai.pSetLayouts        = &comp_dsl;
-  VK_CHECK(vkAllocateDescriptorSets(device, &ai, &comp_set));
-
-  VkDescriptorImageInfo  accum_ii{nullptr, accum_view,        VK_IMAGE_LAYOUT_GENERAL};
-  VkDescriptorImageInfo  disp_ii {nullptr, display_view,      VK_IMAGE_LAYOUT_GENERAL};
-  VkDescriptorBufferInfo cam_bi  {camera_buf,        0,       sizeof(Camera)};
-  VkDescriptorBufferInfo v_bi    {vertex_buffer,     0,       VK_WHOLE_SIZE};
-  VkDescriptorBufferInfo i_bi    {index_buffer,      0,       VK_WHOLE_SIZE};
-  VkDescriptorBufferInfo mat_bi  {material_buffer,   0,       VK_WHOLE_SIZE};
-  VkDescriptorBufferInfo tri_bi  {tri_mat_id_buffer, 0,       VK_WHOLE_SIZE};
-
-  VkWriteDescriptorSetAccelerationStructureKHR as_info{};
-  as_info.sType                      = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
-  as_info.accelerationStructureCount = 1;
-  as_info.pAccelerationStructures    = &tlas;
+  VkDescriptorSetLayoutBindingFlagsCreateInfo flags_ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+  VkDescriptorSetLayoutCreateInfo dsli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  dsli.pNext = &flags_ci;
 
   std::vector<VkDescriptorImageInfo> tex_infos(tex_count);
   for (uint32_t t = 0; t < tex_count; t++)
     tex_infos[t] = {texture_sampler, model_textures[t].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
-  std::array<VkWriteDescriptorSet, 9> writes{};
-  for (auto& w : writes) {
-    w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w.dstSet          = comp_set;
-    w.descriptorCount = 1;
-  }
-  writes[0].dstBinding = 0; writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              writes[0].pImageInfo  = &accum_ii;
-  writes[1].dstBinding = 1; writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              writes[1].pImageInfo  = &disp_ii;
-  writes[2].dstBinding = 2; writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;             writes[2].pBufferInfo = &cam_bi;
-  writes[3].dstBinding = 3; writes[3].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; writes[3].pNext       = &as_info;
-  writes[4].dstBinding = 4; writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             writes[4].pBufferInfo = &v_bi;
-  writes[5].dstBinding = 5; writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             writes[5].pBufferInfo = &i_bi;
-  writes[6].dstBinding = 6; writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             writes[6].pBufferInfo = &mat_bi;
-  writes[7].dstBinding = 7; writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             writes[7].pBufferInfo = &tri_bi;
-  writes[8].dstBinding = 8; writes[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;     writes[8].pImageInfo  = tex_infos.data(); writes[8].descriptorCount = tex_count;
-  vkUpdateDescriptorSets(device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+  VkDescriptorImageInfo  accum_ii{nullptr, accum_view,        VK_IMAGE_LAYOUT_GENERAL};
+  VkDescriptorImageInfo  disp_ii {nullptr, display_view,      VK_IMAGE_LAYOUT_GENERAL};
+  VkDescriptorBufferInfo cam_bi  {camera_buf,        0, sizeof(Camera)};
+  VkDescriptorBufferInfo v_bi    {vertex_buffer,     0, VK_WHOLE_SIZE};
+  VkDescriptorBufferInfo i_bi    {index_buffer,      0, VK_WHOLE_SIZE};
+  VkDescriptorBufferInfo mat_bi  {material_buffer,   0, VK_WHOLE_SIZE};
+  VkDescriptorBufferInfo tri_bi  {tri_mat_id_buffer, 0, VK_WHOLE_SIZE};
 
-  VkPipelineLayoutCreateInfo pli{};
-  pli.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  const char* shader_path;
+
+  if (hw_rt) {
+    // ─── HW RT path: TLAS at binding 3, data at 4-8 ──────────────────────────
+    std::array<VkDescriptorSetLayoutBinding, 9> bindings{};
+    bindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[2] = {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[3] = {3, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[4] = {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[5] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[6] = {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[8] = {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, tex_count,     VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    std::array<VkDescriptorBindingFlags, 9> bf{};
+    bf[8] = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    flags_ci.bindingCount  = 9;
+    flags_ci.pBindingFlags = bf.data();
+    dsli.bindingCount      = 9;
+    dsli.pBindings         = bindings.data();
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &dsli, nullptr, &comp_dsl));
+
+    std::array<VkDescriptorPoolSize, 5> ps{};
+    ps[0] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              2};
+    ps[1] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,             1};
+    ps[2] = {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1};
+    ps[3] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,     std::max(1u, tex_count)};
+    ps[4] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             4};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = 1; pi.poolSizeCount = 5; pi.pPoolSizes = ps.data();
+    VK_CHECK(vkCreateDescriptorPool(device, &pi, nullptr, &comp_pool));
+
+    VkDescriptorSetVariableDescriptorCountAllocateInfo var{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO};
+    var.descriptorSetCount = 1; var.pDescriptorCounts = &tex_count;
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.pNext = &var; ai.descriptorPool = comp_pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &comp_dsl;
+    VK_CHECK(vkAllocateDescriptorSets(device, &ai, &comp_set));
+
+    VkWriteDescriptorSetAccelerationStructureKHR as_info{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+    as_info.accelerationStructureCount = 1; as_info.pAccelerationStructures = &tlas;
+
+    std::array<VkWriteDescriptorSet, 9> writes{};
+    for (auto& w : writes) { w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w.dstSet = comp_set; w.descriptorCount = 1; }
+    writes[0].dstBinding = 0; writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              writes[0].pImageInfo  = &accum_ii;
+    writes[1].dstBinding = 1; writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              writes[1].pImageInfo  = &disp_ii;
+    writes[2].dstBinding = 2; writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;             writes[2].pBufferInfo = &cam_bi;
+    writes[3].dstBinding = 3; writes[3].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; writes[3].pNext       = &as_info;
+    writes[4].dstBinding = 4; writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             writes[4].pBufferInfo = &v_bi;
+    writes[5].dstBinding = 5; writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             writes[5].pBufferInfo = &i_bi;
+    writes[6].dstBinding = 6; writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             writes[6].pBufferInfo = &mat_bi;
+    writes[7].dstBinding = 7; writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             writes[7].pBufferInfo = &tri_bi;
+    writes[8].dstBinding = 8; writes[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;     writes[8].pImageInfo  = tex_infos.data(); writes[8].descriptorCount = tex_count;
+    vkUpdateDescriptorSets(device, 9, writes.data(), 0, nullptr);
+
+    shader_path = SHADER_DIR "raytracer_hw.comp.spv";
+
+  } else {
+    // ─── SW BVH path: BVH nodes at 3, prim_ids at 4, data at 5-9 ────────────
+    VkDescriptorBufferInfo bvh_node_bi{bvh_node_buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo bvh_prim_bi{bvh_prim_buffer, 0, VK_WHOLE_SIZE};
+
+    std::array<VkDescriptorSetLayoutBinding, 10> bindings{};
+    bindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[2] = {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[3] = {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // BVH nodes
+    bindings[4] = {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // BVH prim ids
+    bindings[5] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // vertices
+    bindings[6] = {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // indices
+    bindings[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // materials
+    bindings[8] = {8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // tri_mat_ids
+    bindings[9] = {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, tex_count, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // textures[]
+    std::array<VkDescriptorBindingFlags, 10> bf{};
+    bf[9] = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    flags_ci.bindingCount  = 10;
+    flags_ci.pBindingFlags = bf.data();
+    dsli.bindingCount      = 10;
+    dsli.pBindings         = bindings.data();
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &dsli, nullptr, &comp_dsl));
+
+    std::array<VkDescriptorPoolSize, 4> ps{};
+    ps[0] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          2};
+    ps[1] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         1};
+    ps[2] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, std::max(1u, tex_count)};
+    ps[3] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         6};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = 1; pi.poolSizeCount = 4; pi.pPoolSizes = ps.data();
+    VK_CHECK(vkCreateDescriptorPool(device, &pi, nullptr, &comp_pool));
+
+    VkDescriptorSetVariableDescriptorCountAllocateInfo var{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO};
+    var.descriptorSetCount = 1; var.pDescriptorCounts = &tex_count;
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.pNext = &var; ai.descriptorPool = comp_pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &comp_dsl;
+    VK_CHECK(vkAllocateDescriptorSets(device, &ai, &comp_set));
+
+    std::array<VkWriteDescriptorSet, 10> writes{};
+    for (auto& w : writes) { w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w.dstSet = comp_set; w.descriptorCount = 1; }
+    writes[0].dstBinding = 0; writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          writes[0].pImageInfo  = &accum_ii;
+    writes[1].dstBinding = 1; writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          writes[1].pImageInfo  = &disp_ii;
+    writes[2].dstBinding = 2; writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         writes[2].pBufferInfo = &cam_bi;
+    writes[3].dstBinding = 3; writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         writes[3].pBufferInfo = &bvh_node_bi;
+    writes[4].dstBinding = 4; writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         writes[4].pBufferInfo = &bvh_prim_bi;
+    writes[5].dstBinding = 5; writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         writes[5].pBufferInfo = &v_bi;
+    writes[6].dstBinding = 6; writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         writes[6].pBufferInfo = &i_bi;
+    writes[7].dstBinding = 7; writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         writes[7].pBufferInfo = &mat_bi;
+    writes[8].dstBinding = 8; writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         writes[8].pBufferInfo = &tri_bi;
+    writes[9].dstBinding = 9; writes[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; writes[9].pImageInfo  = tex_infos.data(); writes[9].descriptorCount = tex_count;
+    vkUpdateDescriptorSets(device, 10, writes.data(), 0, nullptr);
+
+    shader_path = SHADER_DIR "raytracer_sw.comp.spv";
+  }
+
+  VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   pli.setLayoutCount = 1;
   pli.pSetLayouts    = &comp_dsl;
   VK_CHECK(vkCreatePipelineLayout(device, &pli, nullptr, &comp_layout));
 
-  VkShaderModule cs = load_shader(SHADER_DIR "raytracer.comp.spv");
-  VkComputePipelineCreateInfo cpci{};
-  cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  VkShaderModule cs = load_shader(shader_path);
+  VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
   cpci.stage  = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, cs, "main", nullptr};
   cpci.layout = comp_layout;
   VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr, &comp_pipeline));
@@ -1124,6 +1187,11 @@ void VulkanApp::cleanup() {
   if (blas_buffer) vkDestroyBuffer(device, blas_buffer, nullptr);
   if (blas_mem) vkFreeMemory(device, blas_mem, nullptr);
 
+  if (bvh_node_buffer) vkDestroyBuffer(device, bvh_node_buffer, nullptr);
+  if (bvh_node_mem)    vkFreeMemory(device, bvh_node_mem, nullptr);
+  if (bvh_prim_buffer) vkDestroyBuffer(device, bvh_prim_buffer, nullptr);
+  if (bvh_prim_mem)    vkFreeMemory(device, bvh_prim_mem, nullptr);
+
   if (tri_mat_id_buffer) vkDestroyBuffer(device, tri_mat_id_buffer, nullptr);
   if (tri_mat_id_mem)    vkFreeMemory(device, tri_mat_id_mem, nullptr);
   if (material_buffer)   vkDestroyBuffer(device, material_buffer, nullptr);
@@ -1315,6 +1383,88 @@ void VulkanApp::load_gltf(const std::string& filepath) {
   LOG_INFO(std::format("Extraction : [{}] sommets, [{}] indices, [{}] triangles",
            vertices.size(), indices.size(), tri_material_ids.size()));
 }
+void VulkanApp::build_sw_bvh() {
+  LOG_INFO("Building software BVH...");
+  const uint32_t tri_count = (uint32_t)(indices.size() / 3);
+  if (tri_count == 0) return;
+
+  // Same model transform as TLAS instance: 180° around X  →  (x,y,z) → (x,-y,-z)
+  auto xform = [](const glm::vec3& p) -> glm::vec3 { return {p.x, -p.y, -p.z}; };
+
+  struct TriInfo { glm::vec3 aabb_min, aabb_max, centroid; };
+  std::vector<TriInfo> tris(tri_count);
+  for (uint32_t t = 0; t < tri_count; t++) {
+    glm::vec3 p0 = xform(vertices[indices[t*3+0]].pos);
+    glm::vec3 p1 = xform(vertices[indices[t*3+1]].pos);
+    glm::vec3 p2 = xform(vertices[indices[t*3+2]].pos);
+    tris[t].aabb_min = glm::min(p0, glm::min(p1, p2));
+    tris[t].aabb_max = glm::max(p0, glm::max(p1, p2));
+    tris[t].centroid = (tris[t].aabb_min + tris[t].aabb_max) * 0.5f;
+  }
+
+  sw_bvh_prim_ids.resize(tri_count);
+  std::iota(sw_bvh_prim_ids.begin(), sw_bvh_prim_ids.end(), 0u);
+  sw_bvh_nodes.clear();
+  sw_bvh_nodes.reserve(tri_count * 2);
+
+  // Recursive BVH builder (midpoint split along longest axis)
+  std::function<void(int, uint32_t, uint32_t)> build = [&](int ni, uint32_t first, uint32_t count) {
+    glm::vec3 bmin(FLT_MAX), bmax(-FLT_MAX);
+    for (uint32_t i = first; i < first + count; i++) {
+      bmin = glm::min(bmin, tris[sw_bvh_prim_ids[i]].aabb_min);
+      bmax = glm::max(bmax, tris[sw_bvh_prim_ids[i]].aabb_max);
+    }
+
+    if (count <= 4) {
+      sw_bvh_nodes[ni] = {bmin, (int)first, bmax, (int)count};
+      return;
+    }
+
+    glm::vec3 ext = bmax - bmin;
+    int axis = (ext.x >= ext.y && ext.x >= ext.z) ? 0 : (ext.y >= ext.z ? 1 : 2);
+    float mid = (bmin[axis] + bmax[axis]) * 0.5f;
+
+    auto pivot = std::partition(
+      sw_bvh_prim_ids.begin() + first,
+      sw_bvh_prim_ids.begin() + first + count,
+      [&](uint32_t ti) { return tris[ti].centroid[axis] < mid; });
+    uint32_t left_count = (uint32_t)(pivot - (sw_bvh_prim_ids.begin() + first));
+
+    if (left_count == 0 || left_count == count) {
+      sw_bvh_nodes[ni] = {bmin, (int)first, bmax, (int)count}; // degenerate → leaf
+      return;
+    }
+
+    // Allocate two child slots before recursing (prevents iterator invalidation)
+    int left_idx = (int)sw_bvh_nodes.size();
+    sw_bvh_nodes[ni] = {bmin, left_idx, bmax, 0}; // internal, right child = left_idx+1
+    sw_bvh_nodes.push_back({});
+    sw_bvh_nodes.push_back({});
+
+    build(left_idx,     first,              left_count);
+    build(left_idx + 1, first + left_count, count - left_count);
+  };
+
+  sw_bvh_nodes.push_back({}); // root at index 0
+  build(0, 0, tri_count);
+  LOG_INFO(std::format("SW BVH: {} nodes, {} triangles", sw_bvh_nodes.size(), tri_count));
+
+  constexpr auto FLAGS = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  void* p;
+
+  VkDeviceSize node_sz = sw_bvh_nodes.size() * sizeof(BVHNode);
+  create_buffer(node_sz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, FLAGS, bvh_node_buffer, bvh_node_mem);
+  vkMapMemory(device, bvh_node_mem, 0, node_sz, 0, &p);
+  memcpy(p, sw_bvh_nodes.data(), node_sz);
+  vkUnmapMemory(device, bvh_node_mem);
+
+  VkDeviceSize prim_sz = sw_bvh_prim_ids.size() * sizeof(uint32_t);
+  create_buffer(prim_sz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, FLAGS, bvh_prim_buffer, bvh_prim_mem);
+  vkMapMemory(device, bvh_prim_mem, 0, prim_sz, 0, &p);
+  memcpy(p, sw_bvh_prim_ids.data(), prim_sz);
+  vkUnmapMemory(device, bvh_prim_mem);
+}
+
 void VulkanApp::create_blas() {
   LOG_INFO("Build BLAS (Hardware BVH)");
 
