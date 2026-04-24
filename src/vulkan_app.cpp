@@ -9,6 +9,12 @@
 #include "Logger/Logger.hpp"
 #include "vulkan_app.h"
 
+#define TINYGLTF_IMPLEMENTATION
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define TINYGLTF_NO_STB_IMAGE_WRITE
+#include "tiny_gltf.h"
+
 // Validation layers
 static const std::vector<const char *> VALIDATION_LAYERS = {
     "VK_LAYER_KHRONOS_validation"};
@@ -59,8 +65,10 @@ void VulkanApp::init_vulkan() {
   }
   create_swapchain();
   create_render_images();
-  build_scene();
+  load_gltf("/media/data/vulkan-gpu/Object3d/dodge_challegner_srt_hellcat.glb");
   upload_scene();
+  create_blas();
+  create_tlas();
   create_compute_pipeline();
   create_display_pipeline();
   create_commands_and_sync();
@@ -227,24 +235,56 @@ void VulkanApp::create_logical_device() {
   qci.queueCount = 1;
   qci.pQueuePriorities = &prio;
 
-  std::vector<const char *> dev_exts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+ // 1. Les extensions nécessaires au Hardware RT
+  std::vector<const char *> dev_exts = {
+      VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+      VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+      VK_KHR_RAY_QUERY_EXTENSION_NAME,
+      VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME
+  };
 #ifdef __APPLE__
   dev_exts.push_back("VK_KHR_portability_subset");
 #endif
+
+  VkPhysicalDeviceBufferDeviceAddressFeatures bda_feats{};
+  bda_feats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+  bda_feats.bufferDeviceAddress = VK_TRUE;
+
+  VkPhysicalDeviceDescriptorIndexingFeatures di_feats{};
+  di_feats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+  di_feats.runtimeDescriptorArray                    = VK_TRUE;
+  di_feats.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+  di_feats.descriptorBindingVariableDescriptorCount  = VK_TRUE;
+  di_feats.descriptorBindingPartiallyBound           = VK_TRUE;
+  di_feats.pNext = &bda_feats;
+
+  VkPhysicalDeviceRayQueryFeaturesKHR rq_feats{};
+  rq_feats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+  rq_feats.rayQuery = VK_TRUE;
+  rq_feats.pNext = &di_feats;
+
+  VkPhysicalDeviceAccelerationStructureFeaturesKHR as_feats{};
+  as_feats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+  as_feats.accelerationStructure = VK_TRUE;
+  as_feats.pNext = &rq_feats;
+
   VkPhysicalDeviceFeatures feats{};
-  feats.shaderInt64 = VK_FALSE;
+  feats.shaderInt64 = VK_TRUE;
 
   VkDeviceCreateInfo ci{};
   ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+  ci.pNext = &as_feats;
   ci.queueCreateInfoCount = 1;
   ci.pQueueCreateInfos = &qci;
   ci.enabledExtensionCount = (uint32_t)dev_exts.size();
   ci.ppEnabledExtensionNames = dev_exts.data();
   ci.pEnabledFeatures = &feats;
+
   if (validation_enabled) {
     ci.enabledLayerCount = (uint32_t)VALIDATION_LAYERS.size();
     ci.ppEnabledLayerNames = VALIDATION_LAYERS.data();
   }
+
   VK_CHECK(vkCreateDevice(phys_dev, &ci, nullptr, &device));
   vkGetDeviceQueue(device, gfx_family, 0, &gfx_queue);
 }
@@ -289,7 +329,7 @@ void VulkanApp::create_swapchain() {
   ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
   ci.preTransform = caps.currentTransform;
   ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-  ci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+  ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
   ci.clipped = VK_TRUE;
   VK_CHECK(vkCreateSwapchainKHR(device, &ci, nullptr, &swapchain));
 
@@ -335,6 +375,7 @@ void VulkanApp::create_render_images() {
 }
 
 // Scene
+/*
 void VulkanApp::build_scene() {
   auto sphere = [](glm::vec3 c, float r, glm::vec3 col, float emit = 0,
                    int mat = 0, float rough = 0.5f,
@@ -372,6 +413,7 @@ void VulkanApp::build_scene() {
   LOG_INFO(std::format("Scene: [{}] spheres, [{}] BVH nodes", spheres.size(),
                        bvh.nodes.size()));
 }
+*/
 
 static void map_copy(VkDevice dev, VkDeviceMemory mem, const void *src,
                      VkDeviceSize sz) {
@@ -382,141 +424,145 @@ static void map_copy(VkDevice dev, VkDeviceMemory mem, const void *src,
 }
 
 void VulkanApp::upload_scene() {
-  constexpr auto FLAGS = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  LOG_INFO("Upload des sommets, indices et materiaux vers la VRAM...");
 
-  VkDeviceSize sphere_sz = spheres.size() * sizeof(GPUSphere);
-  create_buffer(sphere_sz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, FLAGS,
-                sphere_buf, sphere_mem);
-  map_copy(device, sphere_mem, spheres.data(), sphere_sz);
+  constexpr auto FLAGS = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-  VkDeviceSize bvh_sz = bvh.nodes.size() * sizeof(BVHNode);
-  create_buffer(bvh_sz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, FLAGS, bvh_buf,
-                bvh_mem);
-  map_copy(device, bvh_mem, bvh.nodes.data(), bvh_sz);
+  VkDeviceSize vertex_sz = vertices.size() * sizeof(Vertex);
+  create_buffer(vertex_sz,
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+    FLAGS, vertex_buffer, vertex_mem);
+  { void* p; vkMapMemory(device,vertex_mem,0,vertex_sz,0,&p); memcpy(p,vertices.data(),vertex_sz); vkUnmapMemory(device,vertex_mem); }
 
-  VkDeviceSize prim_sz = bvh.prim_indices.size() * sizeof(int);
-  create_buffer(prim_sz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, FLAGS, prim_buf,
-                prim_mem);
-  map_copy(device, prim_mem, bvh.prim_indices.data(), prim_sz);
+  VkDeviceSize index_sz = indices.size() * sizeof(uint32_t);
+  create_buffer(index_sz,
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+    FLAGS, index_buffer, index_mem);
+  { void* p; vkMapMemory(device,index_mem,0,index_sz,0,&p); memcpy(p,indices.data(),index_sz); vkUnmapMemory(device,index_mem); }
 
-  create_buffer(sizeof(Camera), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, FLAGS,
-                camera_buf, camera_mem);
-  vkMapMemory(device, camera_mem, 0, sizeof(Camera), 0, &camera_map);
+  VkDeviceSize cam_sz = sizeof(Camera);
+  create_buffer(cam_sz, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, FLAGS, camera_buf, camera_mem);
+  vkMapMemory(device, camera_mem, 0, cam_sz, 0, &camera_map);
+
+  VkDeviceSize mat_sz = gpu_materials.size() * sizeof(GPUMaterial);
+  create_buffer(mat_sz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, FLAGS, material_buffer, material_mem);
+  { void* p; vkMapMemory(device,material_mem,0,mat_sz,0,&p); memcpy(p,gpu_materials.data(),mat_sz); vkUnmapMemory(device,material_mem); }
+
+  VkDeviceSize tri_sz = tri_material_ids.size() * sizeof(uint32_t);
+  create_buffer(tri_sz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, FLAGS, tri_mat_id_buffer, tri_mat_id_mem);
+  { void* p; vkMapMemory(device,tri_mat_id_mem,0,tri_sz,0,&p); memcpy(p,tri_material_ids.data(),tri_sz); vkUnmapMemory(device,tri_mat_id_mem); }
+
+  LOG_INFO("Upload VRAM termine !");
 }
-
-// Compute pipeline
 void VulkanApp::create_compute_pipeline() {
-  std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
-  // 0: accum image  (storage)
-  bindings[0].binding = 0;
-  bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-  bindings[0].descriptorCount = 1;
-  bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  // 1: display image (storage)
-  bindings[1].binding = 1;
-  bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-  bindings[1].descriptorCount = 1;
-  bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  // 2: camera UBO
-  bindings[2].binding = 2;
-  bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  bindings[2].descriptorCount = 1;
-  bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  // 3: spheres SSBO
-  bindings[3].binding = 3;
-  bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  bindings[3].descriptorCount = 1;
-  bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  // 4: BVH nodes SSBO
-  bindings[4].binding = 4;
-  bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  bindings[4].descriptorCount = 1;
-  bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  // 5: prim indices SSBO
-  bindings[5].binding = 5;
-  bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  bindings[5].descriptorCount = 1;
-  bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  const uint32_t tex_count = (uint32_t)model_textures.size();
+
+  std::array<VkDescriptorSetLayoutBinding, 9> bindings{};
+  bindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  bindings[2] = {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  bindings[3] = {3, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  bindings[4] = {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  bindings[5] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  bindings[6] = {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // materials
+  bindings[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,         VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // tri_mat_ids
+  bindings[8] = {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, tex_count,  VK_SHADER_STAGE_COMPUTE_BIT, nullptr}; // textures[]
+
+  std::array<VkDescriptorBindingFlags, 9> binding_flags{};
+  binding_flags[8] = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT
+                   | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+
+  VkDescriptorSetLayoutBindingFlagsCreateInfo flags_ci{};
+  flags_ci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+  flags_ci.bindingCount  = (uint32_t)binding_flags.size();
+  flags_ci.pBindingFlags = binding_flags.data();
 
   VkDescriptorSetLayoutCreateInfo dsli{};
-  dsli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  dsli.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  dsli.pNext        = &flags_ci;
   dsli.bindingCount = (uint32_t)bindings.size();
-  dsli.pBindings = bindings.data();
+  dsli.pBindings    = bindings.data();
   VK_CHECK(vkCreateDescriptorSetLayout(device, &dsli, nullptr, &comp_dsl));
 
-  std::array<VkDescriptorPoolSize, 3> pool_sizes{};
-  pool_sizes[0] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2};
-  pool_sizes[1] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
-  pool_sizes[2] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+  std::array<VkDescriptorPoolSize, 5> pool_sizes{};
+  pool_sizes[0] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              2};
+  pool_sizes[1] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,             1};
+  pool_sizes[2] = {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1};
+  pool_sizes[3] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,     tex_count};
+  pool_sizes[4] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             4};
+
   VkDescriptorPoolCreateInfo pi{};
-  pi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  pi.maxSets = 1;
+  pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pi.maxSets       = 1;
   pi.poolSizeCount = (uint32_t)pool_sizes.size();
-  pi.pPoolSizes = pool_sizes.data();
+  pi.pPoolSizes    = pool_sizes.data();
   VK_CHECK(vkCreateDescriptorPool(device, &pi, nullptr, &comp_pool));
 
+  VkDescriptorSetVariableDescriptorCountAllocateInfo var_alloc{};
+  var_alloc.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO;
+  var_alloc.descriptorSetCount = 1;
+  var_alloc.pDescriptorCounts  = &tex_count;
+
   VkDescriptorSetAllocateInfo ai{};
-  ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-  ai.descriptorPool = comp_pool;
+  ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  ai.pNext              = &var_alloc;
+  ai.descriptorPool     = comp_pool;
   ai.descriptorSetCount = 1;
-  ai.pSetLayouts = &comp_dsl;
+  ai.pSetLayouts        = &comp_dsl;
   VK_CHECK(vkAllocateDescriptorSets(device, &ai, &comp_set));
 
-  // Write descriptors
-  VkDescriptorImageInfo accum_ii{nullptr, accum_view, VK_IMAGE_LAYOUT_GENERAL};
-  VkDescriptorImageInfo disp_ii{nullptr, display_view, VK_IMAGE_LAYOUT_GENERAL};
-  VkDescriptorBufferInfo cam_bi{camera_buf, 0, sizeof(Camera)};
-  VkDescriptorBufferInfo sph_bi{sphere_buf, 0, VK_WHOLE_SIZE};
-  VkDescriptorBufferInfo bvh_bi{bvh_buf, 0, VK_WHOLE_SIZE};
-  VkDescriptorBufferInfo pri_bi{prim_buf, 0, VK_WHOLE_SIZE};
+  VkDescriptorImageInfo  accum_ii{nullptr, accum_view,        VK_IMAGE_LAYOUT_GENERAL};
+  VkDescriptorImageInfo  disp_ii {nullptr, display_view,      VK_IMAGE_LAYOUT_GENERAL};
+  VkDescriptorBufferInfo cam_bi  {camera_buf,        0,       sizeof(Camera)};
+  VkDescriptorBufferInfo v_bi    {vertex_buffer,     0,       VK_WHOLE_SIZE};
+  VkDescriptorBufferInfo i_bi    {index_buffer,      0,       VK_WHOLE_SIZE};
+  VkDescriptorBufferInfo mat_bi  {material_buffer,   0,       VK_WHOLE_SIZE};
+  VkDescriptorBufferInfo tri_bi  {tri_mat_id_buffer, 0,       VK_WHOLE_SIZE};
 
-  std::array<VkWriteDescriptorSet, 6> writes{};
-  auto W_img = [&](int b, VkDescriptorImageInfo *ii) {
-    writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[b].dstSet = comp_set;
-    writes[b].dstBinding = (uint32_t)b;
-    writes[b].descriptorCount = 1;
-    writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[b].pImageInfo = ii;
-  };
-  auto W_buf = [&](int b, VkDescriptorType type, VkDescriptorBufferInfo *bi) {
-    writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[b].dstSet = comp_set;
-    writes[b].dstBinding = (uint32_t)b;
-    writes[b].descriptorCount = 1;
-    writes[b].descriptorType = type;
-    writes[b].pBufferInfo = bi;
-  };
-  W_img(0, &accum_ii);
-  W_img(1, &disp_ii);
-  W_buf(2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &cam_bi);
-  W_buf(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &sph_bi);
-  W_buf(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &bvh_bi);
-  W_buf(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &pri_bi);
-  vkUpdateDescriptorSets(device, (uint32_t)writes.size(), writes.data(), 0,
-                         nullptr);
+  VkWriteDescriptorSetAccelerationStructureKHR as_info{};
+  as_info.sType                      = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+  as_info.accelerationStructureCount = 1;
+  as_info.pAccelerationStructures    = &tlas;
+
+  std::vector<VkDescriptorImageInfo> tex_infos(tex_count);
+  for (uint32_t t = 0; t < tex_count; t++)
+    tex_infos[t] = {texture_sampler, model_textures[t].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+
+  std::array<VkWriteDescriptorSet, 9> writes{};
+  for (auto& w : writes) {
+    w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet          = comp_set;
+    w.descriptorCount = 1;
+  }
+  writes[0].dstBinding = 0; writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              writes[0].pImageInfo  = &accum_ii;
+  writes[1].dstBinding = 1; writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              writes[1].pImageInfo  = &disp_ii;
+  writes[2].dstBinding = 2; writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;             writes[2].pBufferInfo = &cam_bi;
+  writes[3].dstBinding = 3; writes[3].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; writes[3].pNext       = &as_info;
+  writes[4].dstBinding = 4; writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             writes[4].pBufferInfo = &v_bi;
+  writes[5].dstBinding = 5; writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             writes[5].pBufferInfo = &i_bi;
+  writes[6].dstBinding = 6; writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             writes[6].pBufferInfo = &mat_bi;
+  writes[7].dstBinding = 7; writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             writes[7].pBufferInfo = &tri_bi;
+  writes[8].dstBinding = 8; writes[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;     writes[8].pImageInfo  = tex_infos.data(); writes[8].descriptorCount = tex_count;
+  vkUpdateDescriptorSets(device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
 
   VkPipelineLayoutCreateInfo pli{};
-  pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pli.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   pli.setLayoutCount = 1;
-  pli.pSetLayouts = &comp_dsl;
+  pli.pSetLayouts    = &comp_dsl;
   VK_CHECK(vkCreatePipelineLayout(device, &pli, nullptr, &comp_layout));
 
   VkShaderModule cs = load_shader(SHADER_DIR "raytracer.comp.spv");
   VkComputePipelineCreateInfo cpci{};
-  cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  cpci.stage  = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, cs, "main", nullptr};
   cpci.layout = comp_layout;
-  cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-  cpci.stage.module = cs;
-  cpci.stage.pName = "main";
-  VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr,
-                                    &comp_pipeline));
+  VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr, &comp_pipeline));
   vkDestroyShaderModule(device, cs, nullptr);
 }
-
-// Display pipeline
 void VulkanApp::create_display_pipeline() {
   // Render pass
   VkAttachmentDescription att{};
@@ -787,13 +833,13 @@ void VulkanApp::update_camera_ubo() {
   glm::vec3 vertical = 2.0f * h * up;
 
   Camera cam{};
-  cam.origin = cam_pos;
-  cam.horizontal = horizontal;
-  cam.vertical = vertical;
-  cam.lower_left = cam_pos + forward - horizontal * 0.5f - vertical * 0.5f;
-  cam.width = W;
-  cam.height = H;
-  cam.frame_count = frame_index;
+  cam.origin     = glm::vec4(cam_pos, 1.0f);
+  cam.horizontal = glm::vec4(horizontal, 0.0f);
+  cam.vertical   = glm::vec4(vertical, 0.0f);
+  cam.lower_left = glm::vec4(cam_pos + forward - horizontal * 0.5f - vertical * 0.5f, 1.0f);
+  
+  cam.dimensions = glm::uvec4(W, H, frame_index, 0);
+
   memcpy(camera_map, &cam, sizeof(Camera));
 }
 
@@ -803,9 +849,7 @@ void VulkanApp::draw_frame(uint32_t flight) {
   vkResetFences(device, 1, &fences[flight]);
 
   uint32_t img_idx = 0;
-  VK_CHECK(vkAcquireNextImageKHR(device, swapchain, UINT64_MAX,
-                                 img_available[flight], VK_NULL_HANDLE,
-                                 &img_idx));
+  VK_CHECK(vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, img_available[flight], VK_NULL_HANDLE, &img_idx));
 
   VkCommandBuffer cmd = cmds[flight];
   vkResetCommandBuffer(cmd, 0);
@@ -813,9 +857,9 @@ void VulkanApp::draw_frame(uint32_t flight) {
   VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
 
+  // Compute Shader
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, comp_pipeline);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, comp_layout, 0,
-                          1, &comp_set, 0, nullptr);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, comp_layout, 0, 1, &comp_set, 0, nullptr);
   vkCmdDispatch(cmd, (W + 15) / 16, (H + 15) / 16, 1);
 
   // Memory barrier: compute writes done before fragment reads
@@ -827,9 +871,7 @@ void VulkanApp::draw_frame(uint32_t flight) {
   barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   barrier.image = display_image;
   barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
-                       nullptr, 1, &barrier);
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
   // Display render pass
   VkRenderPassBeginInfo rpbi{};
@@ -839,8 +881,7 @@ void VulkanApp::draw_frame(uint32_t flight) {
   rpbi.renderArea = {{0, 0}, sc_extent};
   vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, disp_pipeline);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, disp_layout, 0,
-                          1, &disp_set, 0, nullptr);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, disp_layout, 0, 1, &disp_set, 0, nullptr);
   vkCmdDraw(cmd, 3, 1, 0, 0);
   vkCmdEndRenderPass(cmd);
 
@@ -849,16 +890,12 @@ void VulkanApp::draw_frame(uint32_t flight) {
   barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
   barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
-                       nullptr, 1, &barrier);
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
   VK_CHECK(vkEndCommandBuffer(cmd));
 
-  VkPipelineStageFlags wait_stage =
-      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-  VkSubmitInfo si{};
-  si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.waitSemaphoreCount = 1;
   si.pWaitSemaphores = &img_available[flight];
   si.pWaitDstStageMask = &wait_stage;
@@ -868,8 +905,7 @@ void VulkanApp::draw_frame(uint32_t flight) {
   si.pSignalSemaphores = &render_done[flight];
   VK_CHECK(vkQueueSubmit(gfx_queue, 1, &si, fences[flight]));
 
-  VkPresentInfoKHR present{};
-  present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+  VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
   present.waitSemaphoreCount = 1;
   present.pWaitSemaphores = &render_done[flight];
   present.swapchainCount = 1;
@@ -905,6 +941,14 @@ void VulkanApp::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
   ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
   ai.allocationSize = req.size;
   ai.memoryTypeIndex = find_memory(req.memoryTypeBits, props);
+
+  VkMemoryAllocateFlagsInfo flagsInfo{};
+  if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) {
+      flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+      flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+      ai.pNext = &flagsInfo;
+  }
+
   VK_CHECK(vkAllocateMemory(device, &ai, nullptr, &mem));
   VK_CHECK(vkBindBufferMemory(device, buf, mem, 0));
 }
@@ -1012,56 +1056,478 @@ std::vector<char> VulkanApp::read_file(const std::string &path) {
 }
 
 void VulkanApp::cleanup() {
-  for (int i = 0; i < MAX_FRAMES; i++) {
-    vkDestroySemaphore(device, img_available[i], nullptr);
-    vkDestroySemaphore(device, render_done[i], nullptr);
-    vkDestroyFence(device, fences[i], nullptr);
+  // 1. On attend que le GPU ait fini de travailler
+  if (device != VK_NULL_HANDLE) {
+    vkDeviceWaitIdle(device);
   }
-  vkDestroyCommandPool(device, command_pool, nullptr);
 
-  vkDestroyPipeline(device, comp_pipeline, nullptr);
-  vkDestroyPipelineLayout(device, comp_layout, nullptr);
-  vkDestroyDescriptorPool(device, comp_pool, nullptr);
-  vkDestroyDescriptorSetLayout(device, comp_dsl, nullptr);
+  if (texture_sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(device, texture_sampler, nullptr);
+    }
+    for (auto& tex : model_textures) {
+        if (tex.view != VK_NULL_HANDLE) vkDestroyImageView(device, tex.view, nullptr);
+        if (tex.image != VK_NULL_HANDLE) vkDestroyImage(device, tex.image, nullptr);
+        if (tex.mem != VK_NULL_HANDLE) vkFreeMemory(device, tex.mem, nullptr);
+    }
+    model_textures.clear();
 
-  vkDestroyPipeline(device, disp_pipeline, nullptr);
-  vkDestroyPipelineLayout(device, disp_layout, nullptr);
-  for (auto fb : disp_fbs)
-    vkDestroyFramebuffer(device, fb, nullptr);
-  vkDestroyRenderPass(device, disp_pass, nullptr);
-  vkDestroyDescriptorPool(device, disp_pool, nullptr);
-  vkDestroyDescriptorSetLayout(device, disp_dsl, nullptr);
+  // 2. On vérifie la taille des tableaux avant de boucler !
+  for (size_t i = 0; i < img_available.size(); i++) {
+    if (img_available[i]) vkDestroySemaphore(device, img_available[i], nullptr);
+  }
+  for (size_t i = 0; i < render_done.size(); i++) {
+    if (render_done[i]) vkDestroySemaphore(device, render_done[i], nullptr);
+  }
+  for (size_t i = 0; i < fences.size(); i++) {
+    if (fences[i]) vkDestroyFence(device, fences[i], nullptr);
+  }
 
-  vkUnmapMemory(device, camera_mem);
-  vkDestroyBuffer(device, camera_buf, nullptr);
-  vkFreeMemory(device, camera_mem, nullptr);
-  vkDestroyBuffer(device, sphere_buf, nullptr);
-  vkFreeMemory(device, sphere_mem, nullptr);
-  vkDestroyBuffer(device, bvh_buf, nullptr);
-  vkFreeMemory(device, bvh_mem, nullptr);
-  vkDestroyBuffer(device, prim_buf, nullptr);
-  vkFreeMemory(device, prim_mem, nullptr);
+  if (command_pool) vkDestroyCommandPool(device, command_pool, nullptr);
 
-  vkDestroySampler(device, display_sampler, nullptr);
-  vkDestroyImageView(device, accum_view, nullptr);
-  vkDestroyImage(device, accum_image, nullptr);
-  vkFreeMemory(device, accum_mem, nullptr);
-  vkDestroyImageView(device, display_view, nullptr);
-  vkDestroyImage(device, display_image, nullptr);
-  vkFreeMemory(device, display_mem, nullptr);
+  if (comp_pipeline) vkDestroyPipeline(device, comp_pipeline, nullptr);
+  if (comp_layout) vkDestroyPipelineLayout(device, comp_layout, nullptr);
+  if (comp_pool) vkDestroyDescriptorPool(device, comp_pool, nullptr);
+  if (comp_dsl) vkDestroyDescriptorSetLayout(device, comp_dsl, nullptr);
 
-  for (auto v : sc_views)
-    vkDestroyImageView(device, v, nullptr);
-  vkDestroySwapchainKHR(device, swapchain, nullptr);
-  vkDestroyDevice(device, nullptr);
-  vkDestroySurfaceKHR(instance, surface, nullptr);
+  if (disp_pipeline) vkDestroyPipeline(device, disp_pipeline, nullptr);
+  if (disp_layout) vkDestroyPipelineLayout(device, disp_layout, nullptr);
+  for (auto fb : disp_fbs) {
+    if (fb) vkDestroyFramebuffer(device, fb, nullptr);
+  }
+  if (disp_pass) vkDestroyRenderPass(device, disp_pass, nullptr);
+  if (disp_pool) vkDestroyDescriptorPool(device, disp_pool, nullptr);
+  if (disp_dsl) vkDestroyDescriptorSetLayout(device, disp_dsl, nullptr);
+
+  // Plus de vkUnmapMemory sauvage ici !
+  if (camera_buf) {
+    vkDestroyBuffer(device, camera_buf, nullptr);
+    vkUnmapMemory(device, camera_mem);
+  }
+  if (camera_mem) vkFreeMemory(device, camera_mem, nullptr);
+
+  // Destroy Tlas
+  if (tlas) {
+    auto vkDestroyAccelerationStructureKHR = (PFN_vkDestroyAccelerationStructureKHR)vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR");
+    if (vkDestroyAccelerationStructureKHR) vkDestroyAccelerationStructureKHR(device, tlas, nullptr);
+  }
+  if (tlas_buffer) vkDestroyBuffer(device, tlas_buffer, nullptr);
+  if (tlas_mem) vkFreeMemory(device, tlas_mem, nullptr);
+  
+  if (instance_buffer) vkDestroyBuffer(device, instance_buffer, nullptr);
+  if (instance_mem) vkFreeMemory(device, instance_mem, nullptr);
+
+  // Destroy Blas
+  if (blas) {
+    auto vkDestroyAccelerationStructureKHR = (PFN_vkDestroyAccelerationStructureKHR)vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR");
+    if (vkDestroyAccelerationStructureKHR) vkDestroyAccelerationStructureKHR(device, blas, nullptr);
+  }
+  if (blas_buffer) vkDestroyBuffer(device, blas_buffer, nullptr);
+  if (blas_mem) vkFreeMemory(device, blas_mem, nullptr);
+
+  if (tri_mat_id_buffer) vkDestroyBuffer(device, tri_mat_id_buffer, nullptr);
+  if (tri_mat_id_mem)    vkFreeMemory(device, tri_mat_id_mem, nullptr);
+  if (material_buffer)   vkDestroyBuffer(device, material_buffer, nullptr);
+  if (material_mem)      vkFreeMemory(device, material_mem, nullptr);
+  if (vertex_buffer) vkDestroyBuffer(device, vertex_buffer, nullptr);
+  if (vertex_mem) vkFreeMemory(device, vertex_mem, nullptr);
+  if (index_buffer) vkDestroyBuffer(device, index_buffer, nullptr);
+  if (index_mem) vkFreeMemory(device, index_mem, nullptr);
+
+  if (display_sampler) vkDestroySampler(device, display_sampler, nullptr);
+  if (accum_view) vkDestroyImageView(device, accum_view, nullptr);
+  if (accum_image) vkDestroyImage(device, accum_image, nullptr);
+  if (accum_mem) vkFreeMemory(device, accum_mem, nullptr);
+  if (display_view) vkDestroyImageView(device, display_view, nullptr);
+  if (display_image) vkDestroyImage(device, display_image, nullptr);
+  if (display_mem) vkFreeMemory(device, display_mem, nullptr);
+
+  for (auto v : sc_views) {
+    if (v) vkDestroyImageView(device, v, nullptr);
+  }
+  if (swapchain) vkDestroySwapchainKHR(device, swapchain, nullptr);
+  if (device) vkDestroyDevice(device, nullptr);
+  if (surface) vkDestroySurfaceKHR(instance, surface, nullptr);
+  
   if (debug_messenger) {
     auto fn = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
         instance, "vkDestroyDebugUtilsMessengerEXT");
-    if (fn)
-      fn(instance, debug_messenger, nullptr);
+    if (fn) fn(instance, debug_messenger, nullptr);
   }
-  vkDestroyInstance(instance, nullptr);
-  glfwDestroyWindow(window);
+  
+  if (instance) vkDestroyInstance(instance, nullptr);
+  if (window) glfwDestroyWindow(window);
   glfwTerminate();
+}
+
+/*Load glb with gltf lib*/
+void VulkanApp::load_gltf(const std::string& filepath) {
+  tinygltf::Model    model;
+  tinygltf::TinyGLTF loader;
+  std::string err, warn;
+
+  LOG_INFO(std::string("Load 3d glb: ") + filepath);
+  bool ret = loader.LoadBinaryFromFile(&model, &err, &warn, filepath);
+  if (!warn.empty()) LOG_WARN("GLTF Warn: " + warn);
+  if (!err.empty())  LOG_ERROR("GLTF Err: " + err);
+  if (!ret) throw std::runtime_error("impossible to load GLB");
+
+  // Charger toutes les images
+  for (const auto& img : model.images)
+    create_texture_from_image(img);
+
+  if (texture_sampler == VK_NULL_HANDLE) {
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter    = VK_FILTER_LINEAR;
+    sci.minFilter    = VK_FILTER_LINEAR;
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    vkCreateSampler(device, &sci, nullptr, &texture_sampler);
+  }
+
+  // Construire la table des materiaux GPU
+  gpu_materials.clear();
+  gpu_materials.reserve(model.materials.size());
+  for (const auto& mat : model.materials) {
+    GPUMaterial gm{};
+
+    // Base color factor (toujours present)
+    const auto& bcf = mat.pbrMetallicRoughness.baseColorFactor;
+    gm.base_r = (float)bcf[0];
+    gm.base_g = (float)bcf[1];
+    gm.base_b = (float)bcf[2];
+    gm.base_a = (float)bcf[3];
+
+    // Metallic / roughness factors
+    gm.metallic  = (float)mat.pbrMetallicRoughness.metallicFactor;
+    gm.roughness = (float)mat.pbrMetallicRoughness.roughnessFactor;
+
+    // Emissive
+    const auto& ef = mat.emissiveFactor;
+    float emax = (float)std::max({ef[0], ef[1], ef[2]});
+    gm.emissive = emax;
+
+    // Base color texture (optionnel)
+    int base_idx = mat.pbrMetallicRoughness.baseColorTexture.index;
+    if (base_idx >= 0) {
+      int src = model.textures[base_idx].source;
+      if (src >= 0) gm.base_tex = (uint32_t)src;
+    }
+
+    // Metallic/roughness texture (optionnel)
+    int mr_idx = mat.pbrMetallicRoughness.metallicRoughnessTexture.index;
+    if (mr_idx >= 0) {
+      int src = model.textures[mr_idx].source;
+      if (src >= 0) gm.mr_tex = (uint32_t)src;
+    }
+
+    gpu_materials.push_back(gm);
+  }
+  if (gpu_materials.empty())
+    gpu_materials.push_back(GPUMaterial{});
+
+  LOG_INFO(std::format("Materiaux GPU construits : [{}] / Images dispo : [{}]", gpu_materials.size(), model_textures.size()));
+  for (size_t mi = 0; mi < gpu_materials.size(); mi++) {
+    const auto& gm = gpu_materials[mi];
+    LOG_INFO(std::format("  Mat[{}] '{}': color=[{:.2f},{:.2f},{:.2f}] metal={:.2f} rough={:.2f} base_tex={} mr_tex={}",
+      mi, model.materials[mi].name,
+      gm.base_r, gm.base_g, gm.base_b,
+      gm.metallic, gm.roughness,
+      gm.base_tex == 0xFFFFFFFF ? -1 : (int)gm.base_tex,
+      gm.mr_tex   == 0xFFFFFFFF ? -1 : (int)gm.mr_tex));
+  }
+
+  // Extraction de la geometrie
+  vertices.clear();
+  indices.clear();
+  tri_material_ids.clear();
+
+  for (const auto& mesh : model.meshes) {
+    for (const auto& primitive : mesh.primitives) {
+
+      uint32_t first_vertex    = (uint32_t)vertices.size();
+      uint32_t tri_count_before = (uint32_t)(indices.size() / 3);
+
+      uint32_t matID = 0;
+      if (primitive.material >= 0 &&
+          (uint32_t)primitive.material < (uint32_t)gpu_materials.size())
+        matID = (uint32_t)primitive.material;
+
+      // Indices
+      if (primitive.indices >= 0) {
+        const auto& acc  = model.accessors[primitive.indices];
+        const auto& bv   = model.bufferViews[acc.bufferView];
+        const uint8_t* p = model.buffers[bv.buffer].data.data()
+                           + bv.byteOffset + acc.byteOffset;
+        if (acc.componentType == TINYGLTF_PARAMETER_TYPE_UNSIGNED_INT) {
+          const uint32_t* buf = reinterpret_cast<const uint32_t*>(p);
+          for (size_t i = 0; i < acc.count; i++) indices.push_back(buf[i] + first_vertex);
+        } else if (acc.componentType == TINYGLTF_PARAMETER_TYPE_UNSIGNED_SHORT) {
+          const uint16_t* buf = reinterpret_cast<const uint16_t*>(p);
+          for (size_t i = 0; i < acc.count; i++) indices.push_back(buf[i] + first_vertex);
+        }
+      }
+
+      uint32_t tri_count_after = (uint32_t)(indices.size() / 3);
+      for (uint32_t t = tri_count_before; t < tri_count_after; t++)
+        tri_material_ids.push_back(matID);
+
+      // Sommets
+      const float* posPtr  = nullptr;
+      const float* normPtr = nullptr;
+      const float* uvPtr   = nullptr;
+      size_t vertexCount   = 0;
+      size_t posStride = 0, normStride = 0, uvStride = 0;
+
+      auto get_attr = [&](const std::string& name, const float*& ptr, size_t& stride) {
+        auto it = primitive.attributes.find(name);
+        if (it == primitive.attributes.end()) return;
+        const auto& acc = model.accessors[it->second];
+        const auto& bv  = model.bufferViews[acc.bufferView];
+        ptr    = reinterpret_cast<const float*>(
+                     model.buffers[bv.buffer].data.data()
+                     + bv.byteOffset + acc.byteOffset);
+        stride = acc.ByteStride(bv)
+                     ? (acc.ByteStride(bv) / sizeof(float))
+                     : (name == "TEXCOORD_0" ? 2u : 3u);
+        vertexCount = acc.count;
+      };
+
+      get_attr("POSITION",   posPtr,  posStride);
+      get_attr("NORMAL",     normPtr, normStride);
+      get_attr("TEXCOORD_0", uvPtr,   uvStride);
+
+      for (size_t i = 0; i < vertexCount; i++) {
+        Vertex v{};
+        v.pos    = posPtr  ? glm::vec3(posPtr [i*posStride],  posPtr [i*posStride+1],  posPtr [i*posStride+2])  : glm::vec3(0.f);
+        v.normal = normPtr ? glm::vec3(normPtr[i*normStride], normPtr[i*normStride+1], normPtr[i*normStride+2]) : glm::vec3(0,1,0);
+        v.uv     = uvPtr   ? glm::vec2(uvPtr  [i*uvStride],   uvPtr  [i*uvStride+1])                           : glm::vec2(0.f);
+        vertices.push_back(v);
+      }
+    }
+  }
+
+  if (!vertices.empty()) {
+    glm::vec3 mn = vertices[0].pos, mx = vertices[0].pos;
+    for (const auto& v : vertices) { mn = glm::min(mn,v.pos); mx = glm::max(mx,v.pos); }
+    glm::vec3 c = (mn+mx)*0.5f, s = mx-mn;
+    LOG_INFO(std::format("Centre [{:.2f},{:.2f},{:.2f}]  Taille [{:.2f},{:.2f},{:.2f}]", c.x,c.y,c.z, s.x,s.y,s.z));
+  }
+  LOG_INFO(std::format("Extraction : [{}] sommets, [{}] indices, [{}] triangles",
+           vertices.size(), indices.size(), tri_material_ids.size()));
+}
+void VulkanApp::create_blas() {
+  LOG_INFO("Build BLAS (Hardware BVH)");
+
+  auto vkGetAccelerationStructureBuildSizesKHR = (PFN_vkGetAccelerationStructureBuildSizesKHR)vkGetDeviceProcAddr(device, "vkGetAccelerationStructureBuildSizesKHR");
+  auto vkCreateAccelerationStructureKHR = (PFN_vkCreateAccelerationStructureKHR)vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR");
+  auto vkCmdBuildAccelerationStructuresKHR = (PFN_vkCmdBuildAccelerationStructuresKHR)vkGetDeviceProcAddr(device, "vkCmdBuildAccelerationStructuresKHR");
+
+  VkBufferDeviceAddressInfo v_bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, vertex_buffer};
+  VkDeviceAddress vertex_addr = vkGetBufferDeviceAddress(device, &v_bda);
+
+  VkBufferDeviceAddressInfo i_bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, index_buffer};
+  VkDeviceAddress index_addr = vkGetBufferDeviceAddress(device, &i_bda);
+
+  VkAccelerationStructureGeometryKHR geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+  geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+  geom.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+  geom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT; // x, y, z
+  geom.geometry.triangles.vertexData.deviceAddress = vertex_addr;
+  geom.geometry.triangles.vertexStride = sizeof(Vertex);
+  geom.geometry.triangles.maxVertex = (uint32_t)(vertices.size() - 1);
+  geom.geometry.triangles.indexType = VK_INDEX_TYPE_UINT32; //uint32_t !
+  geom.geometry.triangles.indexData.deviceAddress = index_addr;
+  geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR; // Optimization no 
+
+  VkAccelerationStructureBuildGeometryInfoKHR build_info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+  build_info.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+  build_info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+  build_info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+  build_info.geometryCount = 1;
+  build_info.pGeometries = &geom;
+
+  uint32_t num_triangles = (uint32_t)(indices.size() / 3);
+
+  VkAccelerationStructureBuildSizesInfoKHR size_info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+  vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info, &num_triangles, &size_info);
+
+  create_buffer(size_info.accelerationStructureSize,
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                blas_buffer, blas_mem);
+
+  VkAccelerationStructureCreateInfoKHR as_ci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+  as_ci.buffer = blas_buffer;
+  as_ci.size = size_info.accelerationStructureSize;
+  as_ci.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+  VK_CHECK(vkCreateAccelerationStructureKHR(device, &as_ci, nullptr, &blas));
+
+  VkBuffer scratch_buf;
+  VkDeviceMemory scratch_mem;
+  create_buffer(size_info.buildScratchSize,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                scratch_buf, scratch_mem);
+
+  VkBufferDeviceAddressInfo s_bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, scratch_buf};
+  build_info.scratchData.deviceAddress = vkGetBufferDeviceAddress(device, &s_bda);
+  build_info.dstAccelerationStructure = blas;
+
+  VkCommandBuffer cmd = begin_one_shot();
+
+  VkAccelerationStructureBuildRangeInfoKHR offset{};
+  offset.primitiveCount = num_triangles;
+  offset.primitiveOffset = 0;
+  offset.firstVertex = 0;
+  offset.transformOffset = 0;
+  const VkAccelerationStructureBuildRangeInfoKHR* pOffset = &offset;
+
+  vkCmdBuildAccelerationStructuresKHR(cmd, 1, &build_info, &pOffset);
+
+  end_one_shot(cmd);
+
+  vkDestroyBuffer(device, scratch_buf, nullptr);
+  vkFreeMemory(device, scratch_mem, nullptr);
+
+  LOG_INFO("Succes : BLAS compile materiellement ! Ta Dodge est prete.");
+}
+
+void VulkanApp::create_tlas() {
+  LOG_INFO("Construction du TLAS (La scene) en cours...");
+
+  auto vkGetAccelerationStructureBuildSizesKHR = (PFN_vkGetAccelerationStructureBuildSizesKHR)vkGetDeviceProcAddr(device, "vkGetAccelerationStructureBuildSizesKHR");
+  auto vkCreateAccelerationStructureKHR = (PFN_vkCreateAccelerationStructureKHR)vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR");
+  auto vkCmdBuildAccelerationStructuresKHR = (PFN_vkCmdBuildAccelerationStructuresKHR)vkGetDeviceProcAddr(device, "vkCmdBuildAccelerationStructuresKHR");
+  auto vkGetAccelerationStructureDeviceAddressKHR = (PFN_vkGetAccelerationStructureDeviceAddressKHR)vkGetDeviceProcAddr(device, "vkGetAccelerationStructureDeviceAddressKHR");
+
+  // 1. Récupérer l'adresse matérielle (GPU) de ton BLAS
+  VkAccelerationStructureDeviceAddressInfoKHR blas_addr_info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+  blas_addr_info.accelerationStructure = blas;
+  VkDeviceAddress blas_addr = vkGetAccelerationStructureDeviceAddressKHR(device, &blas_addr_info);
+
+  // 2. Créer l'Instance de la voiture (Matrice + Lien vers le BLAS)
+  VkAccelerationStructureInstanceKHR instance{};
+
+  glm::mat4 model = glm::mat4(1.0f);
+
+  model = glm::rotate(model, glm::radians(180.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+  // La matrice de transformation (Ici : Matrice identité = Position 0,0,0 et pas de rotation)
+  instance.transform = {
+      model[0][0], model[1][0], model[2][0], model[3][0],
+      model[0][1], model[1][1], model[2][1], model[3][1],
+      model[0][2], model[1][2], model[2][2], model[3][2]
+  };
+  instance.instanceCustomIndex = 0; // Si on avait plusieurs objets, ça serait leur ID
+  instance.mask = 0xFF; // Visible par tous les rayons (Lumière, Ombres, etc)
+  instance.instanceShaderBindingTableRecordOffset = 0;
+  instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+  instance.accelerationStructureReference = blas_addr; // LE PONT : L'instance pointe vers la Dodge
+
+  // 3. Envoyer cette instance dans un Buffer sur la VRAM
+  VkDeviceSize inst_size = sizeof(VkAccelerationStructureInstanceKHR);
+  create_buffer(inst_size,
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                instance_buffer, instance_mem);
+
+  void* data;
+  vkMapMemory(device, instance_mem, 0, inst_size, 0, &data);
+  memcpy(data, &instance, inst_size);
+  vkUnmapMemory(device, instance_mem);
+
+  VkBufferDeviceAddressInfo inst_addr_info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, instance_buffer};
+  VkDeviceAddress inst_addr = vkGetBufferDeviceAddress(device, &inst_addr_info);
+
+  VkAccelerationStructureGeometryKHR geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+  geom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+  geom.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+  geom.geometry.instances.arrayOfPointers = VK_FALSE;
+  geom.geometry.instances.data.deviceAddress = inst_addr;
+
+  VkAccelerationStructureBuildGeometryInfoKHR build_info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+  build_info.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+  build_info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+  build_info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+  build_info.geometryCount = 1;
+  build_info.pGeometries = &geom;
+
+  uint32_t count = 1; // On a 1 seule voiture dans la scène
+
+  VkAccelerationStructureBuildSizesInfoKHR size_info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+  vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info, &count, &size_info);
+
+  create_buffer(size_info.accelerationStructureSize,
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                tlas_buffer, tlas_mem);
+
+  VkAccelerationStructureCreateInfoKHR as_ci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+  as_ci.buffer = tlas_buffer;
+  as_ci.size = size_info.accelerationStructureSize;
+  as_ci.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+  VK_CHECK(vkCreateAccelerationStructureKHR(device, &as_ci, nullptr, &tlas));
+
+  VkBuffer scratch_buf;
+  VkDeviceMemory scratch_mem;
+  create_buffer(size_info.buildScratchSize,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                scratch_buf, scratch_mem);
+
+  VkBufferDeviceAddressInfo s_bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, scratch_buf};
+  build_info.scratchData.deviceAddress = vkGetBufferDeviceAddress(device, &s_bda);
+  build_info.dstAccelerationStructure = tlas;
+
+  VkCommandBuffer cmd = begin_one_shot();
+  VkAccelerationStructureBuildRangeInfoKHR offset{};
+  offset.primitiveCount = 1;
+  const VkAccelerationStructureBuildRangeInfoKHR* pOffset = &offset;
+  vkCmdBuildAccelerationStructuresKHR(cmd, 1, &build_info, &pOffset);
+  end_one_shot(cmd);
+
+  vkDestroyBuffer(device, scratch_buf, nullptr);
+  vkFreeMemory(device, scratch_mem, nullptr);
+
+  LOG_INFO("Succes : TLAS compile ! L'Architecture Hardware est 100% prete.");
+}
+
+void VulkanApp::create_texture_from_image(const tinygltf::Image& img) {
+    VkDeviceSize size = img.width * img.height * 4;
+    
+    // 1. Créer un buffer de staging pour uploader les pixels
+    VkBuffer staging_buf;
+    VkDeviceMemory staging_mem;
+    create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 
+                  staging_buf, staging_mem);
+    
+    map_copy(device, staging_mem, img.image.data(), size);
+
+    // 2. Créer l'image Vulkan
+    Texture tex;
+    create_image2d(img.width, img.height, VK_FORMAT_R8G8B8A8_UNORM, 
+                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 
+                   tex.image, tex.mem);
+
+    // 3. Copier le buffer vers l'image
+    VkCommandBuffer cmd = begin_one_shot();
+    
+    // Transition vers TRANSFER_DST
+    transition_image(cmd, tex.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {(uint32_t)img.width, (uint32_t)img.height, 1};
+    vkCmdCopyBufferToImage(cmd, staging_buf, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    
+    // Transition vers SHADER_READ
+    transition_image(cmd, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    
+    end_one_shot(cmd);
+
+    vkDestroyBuffer(device, staging_buf, nullptr);
+    vkFreeMemory(device, staging_mem, nullptr);
+
+    tex.view = create_image_view(tex.image, VK_FORMAT_R8G8B8A8_UNORM);
+    model_textures.push_back(tex);
 }

@@ -12,7 +12,6 @@ find_package(glm REQUIRED)
 add_executable(raytracer
     src/main.cpp
     src/vulkan_app.cpp
-    src/bvh.cpp
 )
 
 target_include_directories(raytracer PRIVATE src)
